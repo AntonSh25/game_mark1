@@ -719,7 +719,7 @@ def draw_cursor(frame, x, y, gesture, motion_det):
             put(frame,"CHARGED! throw ->",(x-60,y-28),0.5,C_ARROW,1)
         elif st == "pulling":
             ax0 = motion_det.arrow_charge_x()
-            pct = min(1.0, max(0, ax0-x) / MotionDetector.ARROW_PULL)
+            pct = min(1.0, max(0, ax0-x) / motion_det.ARROW_PULL)
             put(frame,f"<- pull {int(pct*100)}%",(x-60,y-28),0.45,C_ARROW,1)
 
     # ── Earthquake: show downward arrow ───────────────────────────────────
