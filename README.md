@@ -68,9 +68,6 @@ Move your open hand fast across a fruit to slice it. Slicing a bomb costs a life
 ## Running
 
 ```bash
-# Gesture controller (hand → keyboard/mouse)
-python main.py
-
 # Fruit Ninja
 python fruit_ninja.py
 
@@ -87,5 +84,3 @@ python spell_game.py
 | Key | Action |
 |---|---|
 | `Q` | Quit |
-| `1` | View mode (main.py) |
-| `2` | Action mode — gestures trigger keystrokes (main.py) |
