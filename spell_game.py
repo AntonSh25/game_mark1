@@ -323,20 +323,19 @@ DTYPE_MAP = {
 # ── Motion spell detector ─────────────────────────────────────────────────────
 
 class MotionDetector:
-    SWIPE_PX   = 155   # horizontal px in 0.5 s  → Meteor Sweep
-    QUAKE_PY   = 115   # downward px in 0.4 s    → Earthquake
-    ORB_DEG    = 300   # cumulative degrees       → Arcane Orb
+    SWIPE_PX   = 130   # peak horizontal displacement → Meteor Sweep
+    QUAKE_PY   = 100   # peak downward displacement   → Earthquake
+    ORB_DEG    = 300   # cumulative degrees            → Arcane Orb
     ORB_MIN_R  = 38    # min circle radius px
-    ARROW_PULL = 65    # pull-left px before charging
-    ARROW_VX   = 35    # rightward px/frame to release
+    ORB_SPEED  = 4     # min px/frame to count angle (filters jitter)
+    ARROW_PULL = 60    # pull-left px before charging
+    ARROW_VX   = 25    # rightward px over 5 frames to release
 
     def __init__(self):
         self._pos   = deque(maxlen=45)   # (x, y, t)
         self._gest  = None
-        # Orb state
         self._orb_cum   = 0.0
         self._orb_prev  = None
-        # Arrow state: "idle" | "pulling" | "charged"
         self._arrow_st  = "idle"
         self._arrow_x0  = 0
 
@@ -363,34 +362,43 @@ class MotionDetector:
         if gesture == "fist":
             recent = [p for p in pos if now - p[2] < 0.5]
             if len(recent) >= 6:
-                dx = recent[-1][0] - recent[0][0]
-                dy_span = max(p[1] for p in recent) - min(p[1] for p in recent)
-                if abs(dx) > self.SWIPE_PX and dy_span < 90:
+                xs = [p[0] for p in recent]
+                ys = [p[1] for p in recent]
+                # peak displacement in dominant direction
+                x_range = max(xs) - min(xs)
+                y_range = max(ys) - min(ys)
+                direction = recent[-1][0] - recent[0][0]
+                if x_range > self.SWIPE_PX and x_range > y_range * 1.8:
                     self._reset_gesture(gesture)
-                    return ("sweep", x, y, "right" if dx > 0 else "left")
+                    return ("sweep", x, y, "right" if direction > 0 else "left")
 
         # ── Earthquake: open hand + fast push down ─────────────────────────
         elif gesture == "open":
-            recent = [p for p in pos if now - p[2] < 0.4]
+            recent = [p for p in pos if now - p[2] < 0.5]
             if len(recent) >= 5:
-                dy = recent[-1][1] - recent[0][1]
-                dx_span = max(p[0] for p in recent) - min(p[0] for p in recent)
-                if dy > self.QUAKE_PY and dx_span < 110:
+                x_coords = [p[0] for p in recent]
+                y_coords = [p[1] for p in recent]
+                y_range  = max(y_coords) - min(y_coords)
+                x_range  = max(x_coords) - min(x_coords)
+                net_down = recent[-1][1] - recent[0][1]
+                if y_range > self.QUAKE_PY and net_down > 0 and y_range > x_range * 1.5:
                     self._reset_gesture(gesture)
                     return ("quake", x, y, None)
 
         # ── Arcane Orb: point finger + draw circle ─────────────────────────
         elif gesture == "point":
-            vx = pos[-1][0] - pos[-2][0]
-            vy = pos[-1][1] - pos[-2][1]
-            if abs(vx) > 1 or abs(vy) > 1:
-                angle = math.atan2(vy, vx)
-                if self._orb_prev is not None:
-                    da = angle - self._orb_prev
-                    while da >  math.pi: da -= 2*math.pi
-                    while da < -math.pi: da += 2*math.pi
-                    self._orb_cum += da
-                self._orb_prev = angle
+            if len(pos) >= 2:
+                vx = pos[-1][0] - pos[-2][0]
+                vy = pos[-1][1] - pos[-2][1]
+                speed = math.hypot(vx, vy)
+                if speed >= self.ORB_SPEED:   # ignore jitter below threshold
+                    angle = math.atan2(vy, vx)
+                    if self._orb_prev is not None:
+                        da = angle - self._orb_prev
+                        while da >  math.pi: da -= 2*math.pi
+                        while da < -math.pi: da += 2*math.pi
+                        self._orb_cum += da
+                    self._orb_prev = angle
 
             if abs(self._orb_cum) >= math.radians(self.ORB_DEG):
                 cx = int(sum(p[0] for p in pos) / len(pos))
@@ -406,14 +414,15 @@ class MotionDetector:
                 self._arrow_x0 = x
                 self._arrow_st = "pulling"
             elif self._arrow_st == "pulling":
-                if self._arrow_x0 - x > self.ARROW_PULL:   # moved left = pulling
+                if self._arrow_x0 - x > self.ARROW_PULL:
                     self._arrow_st = "charged"
             elif self._arrow_st == "charged":
-                vx = pos[-1][0] - pos[-3][0]               # px over 2 frames
-                if vx > self.ARROW_VX:                      # fast throw right
-                    self._arrow_st = "idle"
-                    self._reset_gesture(gesture)
-                    return ("arrow", x, y, None)
+                if len(pos) >= 5:
+                    vx = pos[-1][0] - pos[-5][0]   # velocity over 5 frames
+                    if vx > self.ARROW_VX:
+                        self._arrow_st = "idle"
+                        self._reset_gesture(gesture)
+                        return ("arrow", x, y, None)
 
         return None
 
@@ -802,7 +811,7 @@ def main():
     between_waves = True;  wave_start_t = time.time()
     wave_banner_t = time.time()-20;  spawn_timer = 0.0
 
-    palm_x, palm_y = W//2, H//2
+    palm_x, palm_y = float(W//2), float(H//2)
     cur_gesture    = None
     cooldown_until = 0.0
     combo_text     = "";    combo_t = 0.0
@@ -832,8 +841,10 @@ def main():
         if result.hand_landmarks:
             lm = result.hand_landmarks[0]
             hand_found = True
-            palm_x = int(sum(lm[i].x for i in [0,5,9,13,17])/5*W)
-            palm_y = int(sum(lm[i].y for i in [0,5,9,13,17])/5*H)
+            raw_x = sum(lm[i].x for i in [0,5,9,13,17])/5*W
+            raw_y = sum(lm[i].y for i in [0,5,9,13,17])/5*H
+            palm_x = palm_x * 0.5 + raw_x * 0.5   # EMA smoothing
+            palm_y = palm_y * 0.5 + raw_y * 0.5
             hand   = result.handedness[0][0].category_name
             raw_gesture  = detect_gesture(lm, hand)
             fingers_open = sum(1 for i in range(1,5) if lm[TIPS[i]].y < lm[PIP[i]].y-MARGIN)
@@ -904,7 +915,7 @@ def main():
             spawn_timer = now+random.uniform(0.7,1.5)
 
         # ── Motion spell detection ────────────────────────────────────────────
-        motion_result = motion_det.update(palm_x, palm_y, raw_gesture, now) if hand_found else None
+        motion_result = motion_det.update(int(palm_x), int(palm_y), raw_gesture, now) if hand_found else None
         if motion_result and now >= cooldown_until:
             mspell, mcx, mcy, mextra = motion_result
             pts = cast_motion(mspell, mcx, mcy, mextra, enemies, particles, effects)
@@ -946,7 +957,7 @@ def main():
 
         draw_castle(canvas, castle_hp, CASTLE_HP_MAX)
         if hand_found:
-            draw_cursor(canvas, palm_x, palm_y, cur_gesture, motion_det)
+            draw_cursor(canvas, int(palm_x), int(palm_y), cur_gesture, motion_det)
         draw_spell_bar(canvas)
         draw_top_hud(canvas, score, wave, combo_text, combo_t, now)
         draw_wave_banner(canvas, wave, wave_banner_t, now)
