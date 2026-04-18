@@ -1,10 +1,18 @@
 """
 Spell Caster — defend your castle with hand gestures.
+
+Static spells (hold gesture ~0.6 s):
   fist      → Fireball    (AoE blast at cursor)
   1 finger  → Lightning   (instant beam across cursor height)
   open hand → Frost Nova  (AoE freeze at cursor)
   victory   → Wind Slash  (knockback wave)
   pinch     → Vortex      (2 s pull, setup for combos)
+
+Motion spells (gesture + movement):
+  fist   + horizontal swipe  → Meteor Sweep  (fire wave across all enemies)
+  palm   + fast push DOWN    → Earthquake    (damages ALL enemies on screen)
+  finger + draw CIRCLE       → Arcane Orb    (huge blast at circle center)
+  pinch  + pull LEFT, throw RIGHT → Arcane Arrow (single target, max damage)
 
 Combos (cast two spells within 2.5 s):
   Vortex  → Fireball   = INFERNO  (giant explosion)
@@ -60,6 +68,10 @@ C_FROST  = (255, 215, 160)
 C_WIND   = (70,  225,  70)
 C_VORTEX = (210,  50, 255)
 C_DARK   = (10,   7,  18)
+C_SWEEP  = (20,  60, 230)   # Meteor Sweep
+C_QUAKE  = (40, 160, 100)   # Earthquake
+C_ORB    = (200, 80, 255)   # Arcane Orb
+C_ARROW  = (220, 240, 255)  # Arcane Arrow
 
 SPELLS = {
     "fist":    dict(name="Fireball",   color=C_FIRE,   dmg=3, kind="blast",   hint="[fist]"),
@@ -252,13 +264,170 @@ class Effect:
             for ring in range(3):
                 r=int(getattr(self,"radius",200)*(0.25+ring*0.38)*(0.8+0.2*math.sin(self.t*7+ring)))
                 cv2.circle(f,(int(self.x),int(self.y)),max(1,r),col,max(1,2-ring),cv2.LINE_AA)
+        elif k=="sweep":
+            # Horizontal fire wave moving right
+            prog = self.t / self.dur
+            wx = int(getattr(self,"start_x",0) + prog * (W - getattr(self,"start_x",0)))
+            th = max(1, int(18*a))
+            cv2.line(f,(wx-30,int(self.y)),(wx+30,int(self.y)),col,th,cv2.LINE_AA)
+            cv2.line(f,(wx-30,int(self.y)),(wx+30,int(self.y)),(255,255,255),max(1,th//3),cv2.LINE_AA)
+            # Trailing glow
+            for i in range(4):
+                tx = wx - i*35
+                ta = a * (1.0-i*0.22)
+                tc = tuple(int(c*ta) for c in self.color)
+                cv2.line(f,(tx-20,int(self.y)),(tx+20,int(self.y)),tc,max(1,th-i*3),cv2.LINE_AA)
+        elif k=="quake":
+            # Expanding ground crack rings
+            for ring in range(4):
+                r = int((W*0.55) * min(1.0, self.t/self.dur) * (0.3+ring*0.25))
+                ry = max(1, r//4)
+                cv2.ellipse(f,(int(self.x),int(self.y)),(max(1,r),max(1,ry)),0,0,360,col,2,cv2.LINE_AA)
+            # Flash
+            if self.t < 0.12:
+                fa = 1.0 - self.t/0.12
+                arect(f, 0, 0, W, H, (20,60,30), fa*0.35)
+        elif k=="orb":
+            # Large glowing sphere that expands then contracts
+            max_r = getattr(self,"radius",180)
+            if self.t < self.dur*0.4:
+                r = int(max_r * self.t/(self.dur*0.4))
+            else:
+                r = int(max_r * (1.0-(self.t-self.dur*0.4)/(self.dur*0.6)))
+            r = max(1, r)
+            cv2.circle(f,(int(self.x),int(self.y)),r,col,-1,cv2.LINE_AA)
+            cv2.circle(f,(int(self.x),int(self.y)),r,(255,255,255),3,cv2.LINE_AA)
+            cv2.circle(f,(int(self.x),int(self.y)),max(1,r//2),(255,255,255),1,cv2.LINE_AA)
+        elif k=="arrow":
+            # Bright bolt from start_x to target
+            sx = int(getattr(self,"start_x", int(self.x)))
+            tx = int(getattr(self,"target_x", W))
+            ty = int(self.y)
+            prog = min(1.0, self.t / (self.dur*0.3))
+            ex = int(sx + (tx-sx)*prog)
+            cv2.line(f,(sx,ty),(ex,ty),col,6,cv2.LINE_AA)
+            cv2.line(f,(sx,ty),(ex,ty),(255,255,255),2,cv2.LINE_AA)
+            if self.t > self.dur*0.3:
+                burst_col = col
+                cv2.circle(f,(tx,ty),max(1,int(50*a)),burst_col,-1,cv2.LINE_AA)
+                cv2.circle(f,(tx,ty),max(1,int(55*a)),(255,255,255),2,cv2.LINE_AA)
 
 # ── Spell logic ───────────────────────────────────────────────────────────────
 
 DTYPE_MAP = {
     "blast":"fireball","beam":"lightning","nova":"frost","wave":"wind",
     "vortex":"vortex","inferno":"fireball","shatter":"frost","meteor":"fireball","tornado":"wind",
+    "sweep":"fireball","quake":"wind","orb":"lightning","arrow":"lightning",
 }
+
+# ── Motion spell detector ─────────────────────────────────────────────────────
+
+class MotionDetector:
+    SWIPE_PX   = 155   # horizontal px in 0.5 s  → Meteor Sweep
+    QUAKE_PY   = 115   # downward px in 0.4 s    → Earthquake
+    ORB_DEG    = 300   # cumulative degrees       → Arcane Orb
+    ORB_MIN_R  = 38    # min circle radius px
+    ARROW_PULL = 65    # pull-left px before charging
+    ARROW_VX   = 35    # rightward px/frame to release
+
+    def __init__(self):
+        self._pos   = deque(maxlen=45)   # (x, y, t)
+        self._gest  = None
+        # Orb state
+        self._orb_cum   = 0.0
+        self._orb_prev  = None
+        # Arrow state: "idle" | "pulling" | "charged"
+        self._arrow_st  = "idle"
+        self._arrow_x0  = 0
+
+    def _reset_gesture(self, g):
+        self._pos.clear()
+        self._orb_cum  = 0.0
+        self._orb_prev = None
+        if g != "pinch":
+            self._arrow_st = "idle"
+        self._gest = g
+
+    def update(self, x, y, gesture, now):
+        """Returns (motion_spell_name, cx, cy, extra) or None."""
+        if gesture != self._gest:
+            self._reset_gesture(gesture)
+        self._pos.append((x, y, now))
+
+        if not gesture or len(self._pos) < 3:
+            return None
+
+        pos = list(self._pos)
+
+        # ── Meteor Sweep: fist + horizontal swipe ──────────────────────────
+        if gesture == "fist":
+            recent = [p for p in pos if now - p[2] < 0.5]
+            if len(recent) >= 6:
+                dx = recent[-1][0] - recent[0][0]
+                dy_span = max(p[1] for p in recent) - min(p[1] for p in recent)
+                if abs(dx) > self.SWIPE_PX and dy_span < 90:
+                    self._reset_gesture(gesture)
+                    return ("sweep", x, y, "right" if dx > 0 else "left")
+
+        # ── Earthquake: open hand + fast push down ─────────────────────────
+        elif gesture == "open":
+            recent = [p for p in pos if now - p[2] < 0.4]
+            if len(recent) >= 5:
+                dy = recent[-1][1] - recent[0][1]
+                dx_span = max(p[0] for p in recent) - min(p[0] for p in recent)
+                if dy > self.QUAKE_PY and dx_span < 110:
+                    self._reset_gesture(gesture)
+                    return ("quake", x, y, None)
+
+        # ── Arcane Orb: point finger + draw circle ─────────────────────────
+        elif gesture == "point":
+            vx = pos[-1][0] - pos[-2][0]
+            vy = pos[-1][1] - pos[-2][1]
+            if abs(vx) > 1 or abs(vy) > 1:
+                angle = math.atan2(vy, vx)
+                if self._orb_prev is not None:
+                    da = angle - self._orb_prev
+                    while da >  math.pi: da -= 2*math.pi
+                    while da < -math.pi: da += 2*math.pi
+                    self._orb_cum += da
+                self._orb_prev = angle
+
+            if abs(self._orb_cum) >= math.radians(self.ORB_DEG):
+                cx = int(sum(p[0] for p in pos) / len(pos))
+                cy = int(sum(p[1] for p in pos) / len(pos))
+                radius = sum(math.hypot(p[0]-cx, p[1]-cy) for p in pos) / len(pos)
+                if radius >= self.ORB_MIN_R:
+                    self._reset_gesture(gesture)
+                    return ("orb", cx, cy, int(radius))
+
+        # ── Arcane Arrow: pinch + pull left + throw right ──────────────────
+        elif gesture == "pinch":
+            if self._arrow_st == "idle":
+                self._arrow_x0 = x
+                self._arrow_st = "pulling"
+            elif self._arrow_st == "pulling":
+                if self._arrow_x0 - x > self.ARROW_PULL:   # moved left = pulling
+                    self._arrow_st = "charged"
+            elif self._arrow_st == "charged":
+                vx = pos[-1][0] - pos[-3][0]               # px over 2 frames
+                if vx > self.ARROW_VX:                      # fast throw right
+                    self._arrow_st = "idle"
+                    self._reset_gesture(gesture)
+                    return ("arrow", x, y, None)
+
+        return None
+
+    def orb_progress(self):
+        return min(1.0, abs(self._orb_cum) / math.radians(self.ORB_DEG))
+
+    def orb_trail(self):
+        return [(p[0], p[1]) for p in self._pos] if self._gest == "point" else []
+
+    def arrow_state(self):
+        return self._arrow_st
+
+    def arrow_charge_x(self):
+        return self._arrow_x0
 
 def burst(particles, x, y, color, n=14, spd=6):
     for _ in range(n):
@@ -332,6 +501,63 @@ def cast(spell_key, cx, cy, enemies, particles, effects, combo_kind=None):
 
     return earned
 
+def cast_motion(spell, cx, cy, extra, enemies, particles, effects):
+    """Fire a motion spell. Returns score earned."""
+    earned = 0
+
+    if spell == "sweep":
+        # Horizontal fire wave — damages all enemies near palm_y
+        radius_y = 70
+        for e in enemies:
+            if not e.alive: continue
+            if abs(e.y - cy) < radius_y + e.h // 2:
+                e.take_damage(4, "fireball")
+                burst(particles, e.x, e.y, C_SWEEP, 14, 6)
+                if not e.alive and not e.scored:
+                    earned += e.pts; e.scored = True
+        effects.append(Effect("sweep", cx, cy, C_SWEEP, 0.7, start_x=cx))
+
+    elif spell == "quake":
+        # Hits ALL enemies regardless of position
+        for e in enemies:
+            if not e.alive: continue
+            e.take_damage(2, "wind")
+            e.frozen = 0.8
+            burst(particles, e.x, e.y, C_QUAKE, 10, 4)
+            if not e.alive and not e.scored:
+                earned += e.pts; e.scored = True
+        effects.append(Effect("quake", W//2, H-60, C_QUAKE, 0.8))
+
+    elif spell == "orb":
+        radius = max(100, extra or 120)
+        for e in enemies:
+            if not e.alive: continue
+            if math.hypot(e.x-cx, e.y-cy) < radius + e.w:
+                e.take_damage(6, "lightning")
+                burst(particles, e.x, e.y, C_ORB, 16, 7)
+                if not e.alive and not e.scored:
+                    earned += e.pts; e.scored = True
+        effects.append(Effect("orb", cx, cy, C_ORB, 0.7, radius=radius))
+        burst(particles, cx, cy, C_ORB, 30, 10)
+
+    elif spell == "arrow":
+        # Find nearest enemy, deal massive damage
+        target = min(
+            (e for e in enemies if e.alive),
+            key=lambda e: math.hypot(e.x-cx, e.y-cy),
+            default=None,
+        )
+        tx = target.x if target else W
+        if target:
+            target.take_damage(12, "lightning")
+            burst(particles, target.x, target.y, C_ARROW, 20, 8)
+            if not target.alive and not target.scored:
+                earned += target.pts; target.scored = True
+        effects.append(Effect("arrow", cx, cy, C_ARROW, 0.55,
+                               start_x=cx, target_x=int(tx)))
+
+    return earned
+
 # ── Gesture detection ──────────────────────────────────────────────────────────
 
 def detect_gesture(lm, handedness):
@@ -376,47 +602,63 @@ def draw_castle(frame, hp, mx):
     cv2.rectangle(frame,(cx-8,H-100-bh),(cx+8,H-100),col,-1)
     put(frame,f"{hp}",(cx-10,244),0.46,(200,190,210),1)
 
-def draw_cursor(frame, x, y, gesture, charge):
-    if gesture in SPELLS:
-        col = SPELLS[gesture]["color"]
-        r   = int(18 + charge * 16)
-        cv2.circle(frame,(x,y),r,col,2,cv2.LINE_AA)
-        cv2.circle(frame,(x,y),4,col,-1,cv2.LINE_AA)
-        if charge > 0:
-            ang = int(360*charge)
-            cv2.ellipse(frame,(x,y),(r+5,r+5),-90,0,ang,col,3,cv2.LINE_AA)
-        # Spell name near cursor
-        put(frame, SPELLS[gesture]["name"], (x+r+8, y+6), 0.5, col, 1)
-    else:
-        cv2.circle(frame,(x,y),12,(70,60,90),1,cv2.LINE_AA)
-        cv2.circle(frame,(x,y),3,(110,90,130),-1,cv2.LINE_AA)
+def draw_cursor(frame, x, y, gesture, motion_det):
+    # ── Arcane Orb: draw circle trail ──────────────────────────────────────
+    if gesture == "point":
+        trail = motion_det.orb_trail()
+        prog  = motion_det.orb_progress()
+        if len(trail) >= 2:
+            for i in range(1, len(trail)):
+                a = i / len(trail)
+                col = tuple(int(c*a) for c in C_ORB)
+                cv2.line(frame, trail[i-1], trail[i], col, max(1,int(3*a)), cv2.LINE_AA)
+        if prog > 0:
+            cv2.ellipse(frame,(x,y),(22,22),-90,0,int(360*prog),C_ORB,3,cv2.LINE_AA)
+            put(frame, f"ORB {int(prog*100)}%", (x+26, y+6), 0.45, C_ORB, 1)
 
-def draw_spell_bar(frame, cur_gesture, charge, cooldown):
+    # ── Arcane Arrow: show bow-draw indicator ──────────────────────────────
+    elif gesture == "pinch":
+        st = motion_det.arrow_state()
+        if st == "charged":
+            ax0 = motion_det.arrow_charge_x()
+            cv2.line(frame,(x,y),(ax0,y),C_ARROW,3,cv2.LINE_AA)
+            cv2.line(frame,(ax0,y-20),(ax0,y+20),C_ARROW,2,cv2.LINE_AA)
+            put(frame,"CHARGED! throw ->",(x-60,y-28),0.5,C_ARROW,1)
+        elif st == "pulling":
+            ax0 = motion_det.arrow_charge_x()
+            pct = min(1.0, max(0, ax0-x) / MotionDetector.ARROW_PULL)
+            put(frame,f"<- pull {int(pct*100)}%",(x-60,y-28),0.45,C_ARROW,1)
+
+    # ── Earthquake: show downward arrow ───────────────────────────────────
+    elif gesture == "open":
+        cv2.arrowedLine(frame,(x,y-10),(x,y+30),C_QUAKE,2,cv2.LINE_AA,tipLength=0.4)
+        put(frame,"push DOWN",(x+18,y+10),0.42,C_QUAKE,1)
+
+    # ── Meteor Sweep: show horizontal arrow ───────────────────────────────
+    elif gesture == "fist":
+        cv2.arrowedLine(frame,(x-30,y),(x+30,y),C_SWEEP,2,cv2.LINE_AA,tipLength=0.35)
+        put(frame,"SWIPE",(x-16,y-18),0.42,C_SWEEP,1)
+
+    # Basic cursor dot
+    cv2.circle(frame,(x,y),12,(70,60,90),1,cv2.LINE_AA)
+    cv2.circle(frame,(x,y),3,(110,90,130),-1,cv2.LINE_AA)
+
+def draw_spell_bar(frame):
     y0 = H - 72
     arect(frame, 0, y0-4, W, H, (8,5,14), 0.82)
-    for i, (key, sp) in enumerate(SPELLS.items()):
-        bx = 10 + i * 118
-        active = (key == cur_gesture and cooldown <= 0)
-        bg = (50,35,70) if active else (25,18,38)
-        cv2.rectangle(frame,(bx,y0),(bx+113,y0+64),bg,-1)
-        border_col = sp["color"] if active else (55,40,70)
-        cv2.rectangle(frame,(bx,y0),(bx+113,y0+64),border_col,2 if active else 1)
-        put(frame, sp["name"],  (bx+6, y0+20), 0.44, sp["color"], 1)
-        put(frame, sp["hint"],  (bx+6, y0+37), 0.36, (100,85,125), 1)
-        # Charge bar
-        if active:
-            cw = int(101*charge)
-            cv2.rectangle(frame,(bx+6,y0+46),(bx+6+cw,y0+58),sp["color"],-1)
-        cv2.rectangle(frame,(bx+6,y0+46),(bx+107,y0+58),(55,40,70),1)
-        # Combo hints
-    # Combo reference
-    cx_ref = 10 + len(SPELLS)*118 + 20
-    arect(frame, cx_ref-4, y0, cx_ref+230, H, (15,10,22), 0.5)
-    put(frame,"COMBOS", (cx_ref,y0+16),0.38,(120,100,160),1)
-    combos_brief=[("Vortex+Fire","INFERNO"),("Frost+Bolt","SHATTER"),
-                  ("Fire+Fire","METEOR"),("Wind+Vortex","TORNADO")]
-    for j,(a,b) in enumerate(combos_brief):
-        put(frame,f"{a} = {b}",(cx_ref, y0+30+j*14),0.32,(90,75,120),1)
+    motion_hints = [
+        (C_SWEEP,  "fist + SWIPE",       "Meteor Sweep"),
+        (C_QUAKE,  "palm + push DOWN",   "Earthquake"),
+        (C_ORB,    "finger + CIRCLE",    "Arcane Orb"),
+        (C_ARROW,  "pinch: pull<-  ->",  "Arcane Arrow"),
+    ]
+    bw = (W - 20) // 4
+    for i, (col, hint, name) in enumerate(motion_hints):
+        bx = 10 + i * bw
+        cv2.rectangle(frame, (bx, y0), (bx+bw-4, y0+64), (25,18,38), -1)
+        cv2.rectangle(frame, (bx, y0), (bx+bw-4, y0+64), col, 1)
+        put(frame, name, (bx+6, y0+20), 0.5, col, 1)
+        put(frame, hint, (bx+6, y0+42), 0.38, (110,95,140), 1)
 
 def draw_top_hud(frame, score, wave, combo_text, combo_t, now):
     arect(frame,0,0,W,55,(6,4,12),0.80)
@@ -433,6 +675,98 @@ def draw_pip(frame, cam):
     px0,py0=W-pw-10,H-ph-80
     frame[py0:py0+ph,px0:px0+pw]=pip
     cv2.rectangle(frame,(px0-1,py0-1),(px0+pw,py0+ph),(70,50,90),1)
+
+def draw_hand_icon(img, cx, cy, gesture, color=(170, 150, 210), s=1.0):
+    """Draw a simplified hand silhouette for the given gesture."""
+    # Which fingers are extended: [thumb, index, middle, ring, pinky]
+    UP = {
+        "fist":    [0, 0, 0, 0, 0],
+        "open":    [1, 1, 1, 1, 1],
+        "point":   [0, 1, 0, 0, 0],
+        "victory": [0, 1, 1, 0, 0],
+        "pinch":   [0, 0, 0, 0, 0],
+        # motion spells reuse base gestures
+        "sweep":   [0, 0, 0, 0, 0],
+        "quake":   [1, 1, 1, 1, 1],
+        "orb":     [0, 1, 0, 0, 0],
+        "arrow":   [0, 0, 0, 0, 0],
+    }
+    up = UP.get(gesture, [0, 0, 0, 0, 0])
+
+    pw, ph = int(28*s), int(22*s)
+    palm_y = cy + int(10*s)
+    # Palm
+    cv2.rectangle(img, (cx-pw//2, palm_y-ph//2), (cx+pw//2, palm_y+ph//2), color, -1, cv2.LINE_AA)
+    cv2.rectangle(img, (cx-pw//2, palm_y-ph//2), (cx+pw//2, palm_y+ph//2), (0,0,0), 1, cv2.LINE_AA)
+
+    # Four fingers (index–pinky)
+    finger_xs = [-int(13*s), -int(4*s), int(5*s), int(14*s)]
+    fw = max(2, int(7*s))
+    for i, fx in enumerate(finger_xs):
+        fh = int(26*s) if up[i+1] else int(10*s)
+        fy_top = palm_y - ph//2 - fh
+        cv2.rectangle(img, (cx+fx-fw//2, fy_top), (cx+fx+fw//2, palm_y-ph//2), color, -1, cv2.LINE_AA)
+        cv2.rectangle(img, (cx+fx-fw//2, fy_top), (cx+fx+fw//2, palm_y-ph//2), (0,0,0), 1, cv2.LINE_AA)
+
+    # Thumb (horizontal, left side)
+    tw = int(18*s) if up[0] else int(8*s)
+    tx = cx - pw//2 - tw
+    ty_c = palm_y - int(2*s)
+    cv2.rectangle(img, (tx, ty_c - max(2,int(5*s))), (cx-pw//2, ty_c + max(2,int(5*s))), color, -1, cv2.LINE_AA)
+    cv2.rectangle(img, (tx, ty_c - max(2,int(5*s))), (cx-pw//2, ty_c + max(2,int(5*s))), (0,0,0), 1, cv2.LINE_AA)
+
+    # Pinch: circle between thumb and index tip
+    if gesture == "pinch" or gesture == "arrow":
+        tip_x = cx - pw//2 - int(2*s)
+        tip_y = palm_y - ph//2 - int(8*s)
+        cv2.circle(img, (tip_x, tip_y), max(2, int(7*s)), color, 2, cv2.LINE_AA)
+        cv2.line(img, (cx-pw//2, palm_y-ph//2-int(10*s)), (tip_x, tip_y), color, max(1,int(2*s)), cv2.LINE_AA)
+
+
+def draw_tutorial(frame):
+    """Full tutorial overlay — motion spells only."""
+    arect(frame, 0, 0, W, H, (5, 3, 12), 0.93)
+
+    put(frame, "HOW TO CAST SPELLS", (W//2 - 230, 48), 1.4, (200, 180, 255), 3)
+    cv2.line(frame, (60, 62), (W-60, 62), (60, 45, 90), 1)
+    put(frame, "GESTURE + MOVEMENT", (W//2 - 155, 92), 0.65, (140, 120, 180), 1)
+    cv2.line(frame, (60, 105), (W-60, 105), (50, 38, 72), 1)
+
+    motion_spells = [
+        ("fist",  C_SWEEP, "Meteor Sweep", "Make a FIST  +  SWIPE left or right",  "Hits all enemies in the row", "h"),
+        ("open",  C_QUAKE, "Earthquake",   "OPEN hand  +  PUSH DOWN fast",          "Damages ALL enemies on screen","d"),
+        ("point", C_ORB,   "Arcane Orb",   "Point 1 FINGER  +  Draw a CIRCLE",      "Huge blast at circle center",  "c"),
+        ("arrow", C_ARROW, "Arcane Arrow", "PINCH  +  Pull LEFT, then throw RIGHT", "One target, maximum damage",   "lr"),
+    ]
+
+    row_h = (H - 180) // 4
+    for i, (gest, col, name, motion_hint, desc, sym) in enumerate(motion_spells):
+        y = 120 + i * row_h
+        icon_x, icon_y = 130, y + row_h // 2 - 10
+
+        draw_hand_icon(frame, icon_x, icon_y, gest, col, s=1.4)
+
+        ax, ay = icon_x + 55, icon_y
+        if sym == "h":
+            cv2.arrowedLine(frame, (ax-22, ay), (ax+22, ay), col, 2, cv2.LINE_AA, tipLength=0.35)
+        elif sym == "d":
+            cv2.arrowedLine(frame, (ax, ay-18), (ax, ay+18), col, 2, cv2.LINE_AA, tipLength=0.35)
+        elif sym == "c":
+            cv2.circle(frame, (ax, ay), 16, col, 2, cv2.LINE_AA)
+            cv2.arrowedLine(frame, (ax, ay-16), (ax+8, ay-16), col, 2, cv2.LINE_AA, tipLength=0.6)
+        elif sym == "lr":
+            cv2.arrowedLine(frame, (ax+12, ay-7), (ax-12, ay-7), col, 2, cv2.LINE_AA, tipLength=0.45)
+            cv2.arrowedLine(frame, (ax-12, ay+7), (ax+12, ay+7), col, 2, cv2.LINE_AA, tipLength=0.45)
+
+        put(frame, name,        (220, y + row_h//2 - 22), 0.9,  col, 2)
+        put(frame, motion_hint, (220, y + row_h//2 +  4), 0.48, (160, 145, 190), 1)
+        put(frame, desc,        (220, y + row_h//2 + 22), 0.4,  (100, 88, 130), 1)
+
+        if i < len(motion_spells)-1:
+            cv2.line(frame, (60, y+row_h-4), (W-60, y+row_h-4), (35, 28, 52), 1)
+
+    put(frame, "Press  H  to close", (W//2 - 115, H-18), 0.65, (80, 70, 110), 1)
+
 
 def draw_wave_banner(frame, wave, t, now):
     age = now-t
@@ -470,13 +804,12 @@ def main():
 
     palm_x, palm_y = W//2, H//2
     cur_gesture    = None
-    charge_frames  = 0
     cooldown_until = 0.0
-    last_spell     = None;  last_spell_t = 0.0
-    combo_text     = "";    combo_t      = 0.0
-    vortex_until   = 0.0
+    combo_text     = "";    combo_t = 0.0
+    motion_det     = MotionDetector()
 
     game_over    = False;  open_frames = 0
+    show_tutorial = True   # shown before first wave
     countdown    = 3;      cd_end = time.time()+1.0
 
     print("Spell Caster  |  defend your castle  |  Q = quit")
@@ -508,6 +841,19 @@ def main():
         # ── Canvas ───────────────────────────────────────────────────────────
         canvas = np.full((H, W, 3), C_DARK, dtype=np.uint8)
 
+        # ── Tutorial screen ───────────────────────────────────────────────────
+        if show_tutorial:
+            draw_castle(canvas, castle_hp, CASTLE_HP_MAX)
+            draw_tutorial(canvas)
+            draw_pip(canvas, cam)
+            cv2.imshow("Spell Caster", canvas)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('h'), ord('H'), ord(' '), 13):  # H / Space / Enter
+                show_tutorial = False
+            elif key == ord('q'):
+                break
+            continue
+
         # ── Countdown ────────────────────────────────────────────────────────
         if countdown > 0:
             if now >= cd_end:
@@ -535,9 +881,9 @@ def main():
                 enemies,particles,effects=[],[],[]
                 score=0; castle_hp=CASTLE_HP_MAX; wave=0; wave_queue=[]
                 between_waves=True; wave_start_t=now; wave_banner_t=now-20
-                cur_gesture=None; charge_frames=0; cooldown_until=0.0
-                last_spell=None; last_spell_t=0.0; combo_text=""; combo_t=0.0
-                vortex_until=0.0; game_over=False; open_frames=0
+                cur_gesture=None; cooldown_until=0.0
+                combo_text=""; combo_t=0.0; game_over=False; open_frames=0
+                motion_det = MotionDetector()
                 countdown=3; cd_end=now+1.0
             cv2.imshow("Spell Caster", canvas)
             if cv2.waitKey(1)&0xFF==ord('q'): break
@@ -557,47 +903,17 @@ def main():
             enemies.append(Enemy(wave_queue.pop(0), random.randint(110,H-110)))
             spawn_timer = now+random.uniform(0.7,1.5)
 
-        # ── Vortex release ────────────────────────────────────────────────────
-        if vortex_until > 0 and now > vortex_until:
-            for e in enemies: e.pull_target = None
-            vortex_until = 0.0
+        # ── Motion spell detection ────────────────────────────────────────────
+        motion_result = motion_det.update(palm_x, palm_y, raw_gesture, now) if hand_found else None
+        if motion_result and now >= cooldown_until:
+            mspell, mcx, mcy, mextra = motion_result
+            pts = cast_motion(mspell, mcx, mcy, mextra, enemies, particles, effects)
+            score += pts * 15
+            combo_text = mspell.upper().replace("_"," ")
+            combo_t    = now
+            cooldown_until = now + 0.5
 
-        # ── Gesture → charge → cast ───────────────────────────────────────────
-        can_cast = hand_found and now >= cooldown_until
-        if can_cast and raw_gesture in SPELLS:
-            if raw_gesture == cur_gesture:
-                charge_frames += 1
-            else:
-                cur_gesture   = raw_gesture
-                charge_frames = 1
-
-            if charge_frames >= CHARGE_FRAMES:
-                # Check combo
-                combo_key = (last_spell, cur_gesture)
-                if last_spell and (now-last_spell_t < 2.5) and combo_key in COMBOS:
-                    cname, ccol, ckind = COMBOS[combo_key]
-                    score      += cast(cur_gesture, palm_x, palm_y, enemies, particles, effects,
-                                       combo_kind=ckind) * 3 + 60
-                    combo_text  = cname
-                    combo_t     = now
-                    last_spell  = None
-                else:
-                    pts = cast(cur_gesture, palm_x, palm_y, enemies, particles, effects)
-                    score      += pts * 10
-                    if cur_gesture == "pinch":
-                        vortex_until = now+2.0
-                    last_spell   = cur_gesture
-                    last_spell_t = now
-
-                cooldown_until = now+0.45
-                charge_frames  = 0
-                cur_gesture    = None
-        else:
-            if raw_gesture != cur_gesture:
-                cur_gesture   = raw_gesture
-                charge_frames = 0
-
-        charge = min(1.0, charge_frames/CHARGE_FRAMES) if can_cast else 0.0
+        cur_gesture = raw_gesture
 
         # ── Update ────────────────────────────────────────────────────────────
         for e in enemies:
@@ -630,16 +946,22 @@ def main():
 
         draw_castle(canvas, castle_hp, CASTLE_HP_MAX)
         if hand_found:
-            draw_cursor(canvas, palm_x, palm_y, cur_gesture, charge)
-        draw_spell_bar(canvas, cur_gesture, charge, max(0, cooldown_until-now))
+            draw_cursor(canvas, palm_x, palm_y, cur_gesture, motion_det)
+        draw_spell_bar(canvas)
         draw_top_hud(canvas, score, wave, combo_text, combo_t, now)
         draw_wave_banner(canvas, wave, wave_banner_t, now)
         if between_waves and wave > 0 and now-wave_start_t < 3.0:
             draw_between_waves(canvas, wave, 3.0-(now-wave_start_t))
         draw_pip(canvas, cam)
 
+        if show_tutorial:
+            draw_tutorial(canvas)
+
         cv2.imshow("Spell Caster", canvas)
-        if cv2.waitKey(1)&0xFF==ord('q'): break
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        if key in (ord('h'), ord('H')):
+            show_tutorial = not show_tutorial
 
     cap.release()
     cv2.destroyAllWindows()
