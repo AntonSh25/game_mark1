@@ -30,6 +30,8 @@ import time
 import random
 import math
 import os
+import json
+import csv
 from collections import deque
 
 # ── MediaPipe ─────────────────────────────────────────────────────────────────
@@ -320,29 +322,79 @@ DTYPE_MAP = {
     "sweep":"fireball","quake":"wind","orb":"lightning","arrow":"lightning",
 }
 
+# ── Calibration & Logging ─────────────────────────────────────────────────────
+
+CALIB_PATH = os.path.join(os.path.dirname(__file__), "calibration.json")
+LOG_PATH   = os.path.join(os.path.dirname(__file__), "motion_log.csv")
+
+CALIB_DEFAULTS = {
+    "swipe_px": 130, "quake_py": 100, "arrow_pull": 60, "arrow_vx": 25,
+}
+
+def load_calibration():
+    try:
+        with open(CALIB_PATH) as f:
+            return {**CALIB_DEFAULTS, **json.load(f)}
+    except Exception:
+        return CALIB_DEFAULTS.copy()
+
+def save_calibration(c):
+    with open(CALIB_PATH, "w") as f:
+        json.dump(c, f, indent=2)
+
+
+class Logger:
+    _HEADER = ["timestamp", "event", "gesture", "spell", "value", "threshold", "ratio"]
+
+    def __init__(self):
+        new_file = not os.path.exists(LOG_PATH)
+        self._f  = open(LOG_PATH, "a", newline="")
+        self._w  = csv.writer(self._f)
+        if new_file:
+            self._w.writerow(self._HEADER)
+
+    def log(self, event, gesture, spell, value, threshold):
+        ratio = round(value / threshold, 2) if threshold else 0.0
+        self._w.writerow([
+            time.strftime("%Y-%m-%d %H:%M:%S"), event, gesture, spell,
+            round(value, 1), round(threshold, 1), ratio,
+        ])
+        self._f.flush()
+
+    def close(self):
+        self._f.close()
+
+
 # ── Motion spell detector ─────────────────────────────────────────────────────
 
 class MotionDetector:
-    SWIPE_PX   = 130   # peak horizontal displacement → Meteor Sweep
-    QUAKE_PY   = 100   # peak downward displacement   → Earthquake
-    ORB_DEG    = 300   # cumulative degrees            → Arcane Orb
-    ORB_MIN_R  = 38    # min circle radius px
-    ORB_SPEED  = 4     # min px/frame to count angle (filters jitter)
-    ARROW_PULL = 60    # pull-left px before charging
-    ARROW_VX   = 25    # rightward px over 5 frames to release
+    ORB_DEG   = 300
+    ORB_MIN_R = 38
+    ORB_SPEED = 4
 
-    def __init__(self):
-        self._pos   = deque(maxlen=45)   # (x, y, t)
-        self._gest  = None
-        self._orb_cum   = 0.0
-        self._orb_prev  = None
-        self._arrow_st  = "idle"
-        self._arrow_x0  = 0
+    def __init__(self, calib=None):
+        c = calib or {}
+        self.SWIPE_PX   = c.get("swipe_px",   130)
+        self.QUAKE_PY   = c.get("quake_py",   100)
+        self.ARROW_PULL = c.get("arrow_pull",  60)
+        self.ARROW_VX   = c.get("arrow_vx",    25)
+        self._pos        = deque(maxlen=45)
+        self._gest       = None
+        self._orb_cum    = 0.0
+        self._orb_prev   = None
+        self._arrow_st   = "idle"
+        self._arrow_x0   = 0
+        self._session_peak = 0.0   # peak metric value in current gesture session
+        self.prev_session  = None  # {"gesture", "peak"} — filled on gesture change for logging
 
     def _reset_gesture(self, g):
+        # save session peak before clearing
+        if self._gest and self._session_peak > 0:
+            self.prev_session = {"gesture": self._gest, "peak": self._session_peak}
         self._pos.clear()
-        self._orb_cum  = 0.0
-        self._orb_prev = None
+        self._orb_cum    = 0.0
+        self._orb_prev   = None
+        self._session_peak = 0.0
         if g != "pinch":
             self._arrow_st = "idle"
         self._gest = g
@@ -364,10 +416,10 @@ class MotionDetector:
             if len(recent) >= 6:
                 xs = [p[0] for p in recent]
                 ys = [p[1] for p in recent]
-                # peak displacement in dominant direction
-                x_range = max(xs) - min(xs)
-                y_range = max(ys) - min(ys)
+                x_range   = max(xs) - min(xs)
+                y_range   = max(ys) - min(ys)
                 direction = recent[-1][0] - recent[0][0]
+                self._session_peak = max(self._session_peak, x_range)
                 if x_range > self.SWIPE_PX and x_range > y_range * 1.8:
                     self._reset_gesture(gesture)
                     return ("sweep", x, y, "right" if direction > 0 else "left")
@@ -381,6 +433,7 @@ class MotionDetector:
                 y_range  = max(y_coords) - min(y_coords)
                 x_range  = max(x_coords) - min(x_coords)
                 net_down = recent[-1][1] - recent[0][1]
+                self._session_peak = max(self._session_peak, y_range)
                 if y_range > self.QUAKE_PY and net_down > 0 and y_range > x_range * 1.5:
                     self._reset_gesture(gesture)
                     return ("quake", x, y, None)
@@ -391,7 +444,7 @@ class MotionDetector:
                 vx = pos[-1][0] - pos[-2][0]
                 vy = pos[-1][1] - pos[-2][1]
                 speed = math.hypot(vx, vy)
-                if speed >= self.ORB_SPEED:   # ignore jitter below threshold
+                if speed >= self.ORB_SPEED:
                     angle = math.atan2(vy, vx)
                     if self._orb_prev is not None:
                         da = angle - self._orb_prev
@@ -399,6 +452,7 @@ class MotionDetector:
                         while da < -math.pi: da += 2*math.pi
                         self._orb_cum += da
                     self._orb_prev = angle
+            self._session_peak = max(self._session_peak, abs(self._orb_cum))
 
             if abs(self._orb_cum) >= math.radians(self.ORB_DEG):
                 cx = int(sum(p[0] for p in pos) / len(pos))
@@ -414,17 +468,47 @@ class MotionDetector:
                 self._arrow_x0 = x
                 self._arrow_st = "pulling"
             elif self._arrow_st == "pulling":
-                if self._arrow_x0 - x > self.ARROW_PULL:
+                pull = max(0, self._arrow_x0 - x)
+                self._session_peak = max(self._session_peak, pull)
+                if pull > self.ARROW_PULL:
                     self._arrow_st = "charged"
             elif self._arrow_st == "charged":
                 if len(pos) >= 5:
-                    vx = pos[-1][0] - pos[-5][0]   # velocity over 5 frames
+                    vx = pos[-1][0] - pos[-5][0]
                     if vx > self.ARROW_VX:
                         self._arrow_st = "idle"
                         self._reset_gesture(gesture)
                         return ("arrow", x, y, None)
 
         return None
+
+    def get_metrics(self, now):
+        """Current live metrics for debug overlay."""
+        pos = list(self._pos)
+        g   = self._gest
+        m   = {"gesture": g, "session_peak": self._session_peak}
+        if g == "fist" and pos:
+            recent = [p for p in pos if now - p[2] < 0.5]
+            if len(recent) >= 2:
+                xs = [p[0] for p in recent]
+                ys = [p[1] for p in recent]
+                m["x_range"] = max(xs) - min(xs)
+                m["y_range"] = max(ys) - min(ys)
+        elif g == "open" and pos:
+            recent = [p for p in pos if now - p[2] < 0.5]
+            if len(recent) >= 2:
+                xs = [p[0] for p in recent]
+                ys = [p[1] for p in recent]
+                m["y_range"]  = max(ys) - min(ys)
+                m["x_range"]  = max(xs) - min(xs)
+                m["net_down"] = recent[-1][1] - recent[0][1]
+        elif g == "point":
+            m["orb_pct"] = self.orb_progress()
+        elif g == "pinch":
+            m["arrow_state"] = self._arrow_st
+            m["arrow_pull"]  = max(0, self._arrow_x0 - (pos[-1][0] if pos else self._arrow_x0))
+            m["arrow_vx"]    = (pos[-1][0] - pos[-5][0]) if len(pos) >= 5 else 0
+        return m
 
     def orb_progress(self):
         return min(1.0, abs(self._orb_cum) / math.radians(self.ORB_DEG))
@@ -794,6 +878,182 @@ def draw_game_over(frame, score, best):
     put(frame,f"Best:   {best:06d}", (W//2-130,H//2+65),1.3,(70,215,255),2)
     put(frame,"Open hand to restart",(W//2-195,H//2+130),0.9,(140,130,175),1)
 
+# ── Calibration screen ────────────────────────────────────────────────────────
+
+def run_calibration(cap, start_ms):
+    """3-step interactive calibration. Returns calibration dict."""
+    steps = [
+        ("swipe_px",   "fist",  C_SWEEP, "Meteor Sweep",
+         "Make a FIST  +  SWIPE hard left or right", 60, 0.70),
+        ("quake_py",   "open",  C_QUAKE, "Earthquake",
+         "Open PALM  +  push DOWN hard and fast",    55, 0.70),
+        ("arrow_pull", "pinch", C_ARROW, "Arcane Arrow",
+         "PINCH fingers  +  pull LEFT as far as you can", 35, 0.75),
+    ]
+    results = {}
+
+    for si, (key, gest, col, label, instr, floor, scale) in enumerate(steps):
+        peak   = 0.0
+        t0     = time.time()
+        pos_q  = deque(maxlen=30)
+        anchor = None
+
+        while True:
+            ret, cam = cap.read()
+            if not ret: break
+            cam   = cv2.flip(cam, 1)
+            now   = time.time()
+            left  = max(0.0, 7.0 - (now - t0))
+            ts_ms = int(now * 1000) - start_ms
+
+            rgb    = cv2.cvtColor(cam, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res    = landmarker.detect_for_video(mp_img, ts_ms)
+
+            gesture = None
+            px, py  = W//2, H//2
+            if res.hand_landmarks:
+                lm      = res.hand_landmarks[0]
+                hand    = res.handedness[0][0].category_name
+                gesture = detect_gesture(lm, hand)
+                px = int(sum(lm[i].x for i in [0,5,9,13,17])/5*W)
+                py = int(sum(lm[i].y for i in [0,5,9,13,17])/5*H)
+
+            if gesture == gest:
+                pos_q.append((px, py, now))
+            else:
+                pos_q.clear()
+                anchor = None
+
+            cur_val = 0.0
+            if gesture == gest and len(pos_q) >= 2:
+                recent = [p for p in pos_q if now - p[2] < 0.5]
+                if len(recent) >= 2:
+                    if key == "swipe_px":
+                        xs = [p[0] for p in recent]
+                        cur_val = max(xs) - min(xs)
+                    elif key == "quake_py":
+                        ys = [p[1] for p in recent]
+                        cur_val = max(ys) - min(ys)
+                    elif key == "arrow_pull":
+                        if anchor is None: anchor = px
+                        cur_val = max(0, anchor - px)
+            peak = max(peak, cur_val)
+
+            # ── Draw ──
+            canvas = np.full((H, W, 3), C_DARK, dtype=np.uint8)
+            arect(canvas, 0, 0, W, H, (4, 3, 10), 0.5)
+
+            put(canvas, f"CALIBRATION  (Step {si+1} / {len(steps)})",
+                (W//2 - 240, 48), 1.2, (200, 180, 255), 2)
+            cv2.line(canvas, (60, 62), (W-60, 62), (60, 45, 90), 1)
+
+            draw_hand_icon(canvas, 130, H//2, gest, col, s=2.0)
+            put(canvas, label, (220, H//2 - 55), 1.0, col, 2)
+            put(canvas, instr, (220, H//2 - 20), 0.55, (160, 145, 190), 1)
+
+            default_th = CALIB_DEFAULTS[key]
+            bar_x, bar_y, bar_w = 220, H//2 + 20, 560
+            bar_max = default_th * 2.2
+            cv2.rectangle(canvas, (bar_x, bar_y), (bar_x+bar_w, bar_y+22), (28, 20, 42), -1)
+            cv2.rectangle(canvas, (bar_x, bar_y), (bar_x+bar_w, bar_y+22), (55, 40, 70), 1)
+            # current value
+            cv2.rectangle(canvas, (bar_x, bar_y),
+                          (bar_x + min(bar_w, int(bar_w*cur_val/bar_max)), bar_y+22), col, -1)
+            # peak marker (white line)
+            pm = bar_x + min(bar_w, int(bar_w*peak/bar_max))
+            cv2.line(canvas, (pm, bar_y-4), (pm, bar_y+26), (255,255,255), 2)
+            # default threshold marker (dim)
+            dm = bar_x + min(bar_w, int(bar_w*default_th/bar_max))
+            cv2.line(canvas, (dm, bar_y-6), (dm, bar_y+28), (120, 100, 160), 1)
+
+            put(canvas, f"Now: {cur_val:.0f}px",    (bar_x,       bar_y+36), 0.45, col, 1)
+            put(canvas, f"Best: {peak:.0f}px",      (bar_x+180,   bar_y+36), 0.45, (210,200,230), 1)
+            put(canvas, f"Default: {default_th}px", (bar_x+370,   bar_y+36), 0.45, (100, 85, 130), 1)
+
+            # timer bar
+            ty = H - 75
+            cv2.rectangle(canvas, (60, ty), (W-60, ty+14), (28, 20, 42), -1)
+            tf = int((W-120) * left / 7.0)
+            cv2.rectangle(canvas, (60, ty), (60+tf, ty+14),
+                          (40, 200, 80) if left > 3 else (40, 80, 200), -1)
+            put(canvas, f"{left:.1f}s remaining", (W//2-70, ty+12), 0.45, (150,140,190), 1)
+            put(canvas, "Press SPACE to skip", (W//2-115, H-30), 0.5, (70, 60, 95), 1)
+
+            draw_pip(canvas, cam)
+            cv2.imshow("Spell Caster", canvas)
+            k = cv2.waitKey(1) & 0xFF
+            if k in (ord(' '), ord('q')) or left <= 0:
+                break
+
+        results[key] = max(floor, int(peak * scale)) if peak > floor else CALIB_DEFAULTS[key]
+
+    new_calib = {**load_calibration(), **results}
+    save_calibration(new_calib)
+
+    # Summary
+    t_end = time.time() + 3.0
+    while time.time() < t_end:
+        ret, cam = cap.read()
+        if not ret: break
+        canvas = np.full((H, W, 3), C_DARK, dtype=np.uint8)
+        put(canvas, "CALIBRATION COMPLETE", (W//2-265, H//2-70), 1.4, (140,220,140), 3)
+        cv2.line(canvas, (60, H//2-45), (W-60, H//2-45), (60,90,60), 1)
+        for i, (key, _, col, label, _, _, _) in enumerate(steps):
+            val = new_calib[key]
+            put(canvas, f"{label}:  {val}px   (default {CALIB_DEFAULTS[key]}px)",
+                (W//2-240, H//2+i*36), 0.6, col, 1)
+        put(canvas, "Saved to calibration.json", (W//2-165, H//2+130), 0.5, (80,160,80), 1)
+        cv2.imshow("Spell Caster", canvas)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    return new_calib
+
+
+# ── Debug overlay ─────────────────────────────────────────────────────────────
+
+def draw_debug_overlay(frame, motion_det, calib, now):
+    m   = motion_det.get_metrics(now)
+    g   = m.get("gesture")
+    x0, y0 = W - 270, 62
+    arect(frame, x0-6, y0-6, W-8, y0+128, (6, 4, 12), 0.88)
+    put(frame, "DEBUG  (D to hide)", (x0, y0+12), 0.38, (80, 65, 110), 1)
+    put(frame, f"gesture: {g or 'none'}", (x0, y0+28), 0.42, (140, 120, 180), 1)
+
+    def _bar(val, threshold, label, by):
+        ratio = val / threshold if threshold else 0
+        col   = (40,200,80) if ratio >= 1.0 else ((200,180,40) if ratio >= 0.5 else (180,80,60))
+        put(frame, f"{label}: {val:.0f} / {threshold}",  (x0, by), 0.4, col, 1)
+        bw = 220
+        cv2.rectangle(frame, (x0, by+6),  (x0+bw, by+14), (28,20,42), -1)
+        cv2.rectangle(frame, (x0, by+6),  (x0+min(bw,int(bw*ratio)), by+14), col, -1)
+        tm = x0 + min(bw, int(bw * 1.0))  # threshold line at 100%
+        cv2.line(frame, (tm, by+4), (tm, by+16), (255,255,255), 1)
+
+    if g == "fist":
+        _bar(m.get("x_range",0), calib["swipe_px"], "x_range", y0+44)
+        _bar(m.get("y_range",0), calib["swipe_px"], "y_range", y0+70)
+    elif g == "open":
+        _bar(m.get("y_range",0),  calib["quake_py"], "y_range",  y0+44)
+        _bar(m.get("net_down",0), calib["quake_py"], "net_down", y0+70)
+    elif g == "point":
+        pct = m.get("orb_pct", 0)
+        put(frame, f"orb: {pct*100:.0f}%", (x0, y0+44), 0.42,
+            (40,200,80) if pct >= 1.0 else (200,160,80), 1)
+        bw = 220
+        cv2.rectangle(frame, (x0, y0+50), (x0+bw, y0+60), (28,20,42), -1)
+        cv2.rectangle(frame, (x0, y0+50), (x0+min(bw,int(bw*pct)), y0+60), C_ORB, -1)
+    elif g == "pinch":
+        st = m.get("arrow_state","idle")
+        put(frame, f"state: {st}", (x0, y0+44), 0.42, (160,140,200), 1)
+        _bar(m.get("arrow_pull",0), calib["arrow_pull"], "pull", y0+62)
+        _bar(max(0,m.get("arrow_vx",0)), calib["arrow_vx"], "vx",   y0+88)
+
+    pk = m.get("session_peak", 0)
+    put(frame, f"session peak: {pk:.0f}", (x0, y0+112), 0.38, (100,85,130), 1)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -803,6 +1063,34 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     start_ms  = int(time.time()*1000)
+    calib     = load_calibration()
+    logger    = Logger()
+
+    # ── Startup screen: calibrate or play ────────────────────────────────────
+    calib_exists = os.path.exists(CALIB_PATH)
+    while True:
+        ret, cam = cap.read()
+        if not ret: break
+        cam = cv2.flip(cam, 1)
+        canvas = np.full((H, W, 3), C_DARK, dtype=np.uint8)
+        put(canvas, "SPELL CASTER", (W//2-185, H//2-90), 1.8, (200,180,255), 3)
+        cv2.line(canvas, (60, H//2-60), (W-60, H//2-60), (60,45,90), 1)
+        put(canvas, "C  =  Calibrate gestures", (W//2-195, H//2-20), 0.7, (C_SWEEP[0],C_SWEEP[1],C_SWEEP[2]), 1)
+        label = "SPACE  =  Play  (saved calibration)" if calib_exists else "SPACE  =  Play  (default settings)"
+        put(canvas, label, (W//2-245, H//2+20), 0.7, (140,120,180), 1)
+        put(canvas, "Q  =  Quit", (W//2-65, H//2+58), 0.55, (80,68,105), 1)
+        draw_pip(canvas, cam)
+        cv2.imshow("Spell Caster", canvas)
+        k = cv2.waitKey(1) & 0xFF
+        if k == ord('c') or k == ord('C'):
+            calib = run_calibration(cap, start_ms)
+            break
+        elif k == ord(' ') or k == 13:
+            break
+        elif k == ord('q'):
+            cap.release(); cv2.destroyAllWindows(); landmarker.close()
+            logger.close(); return
+
     prev_time = time.time()
 
     enemies, particles, effects = [], [], []
@@ -815,13 +1103,14 @@ def main():
     cur_gesture    = None
     cooldown_until = 0.0
     combo_text     = "";    combo_t = 0.0
-    motion_det     = MotionDetector()
+    motion_det     = MotionDetector(calib)
 
-    game_over    = False;  open_frames = 0
-    show_tutorial = True   # shown before first wave
-    countdown    = 3;      cd_end = time.time()+1.0
+    game_over     = False;  open_frames = 0
+    show_tutorial = True
+    show_debug    = False
+    countdown     = 3;      cd_end = time.time()+1.0
 
-    print("Spell Caster  |  defend your castle  |  Q = quit")
+    print("Spell Caster  |  Q = quit  |  H = tutorial  |  D = debug overlay")
 
     while True:
         ret, cam = cap.read()
@@ -894,7 +1183,7 @@ def main():
                 between_waves=True; wave_start_t=now; wave_banner_t=now-20
                 cur_gesture=None; cooldown_until=0.0
                 combo_text=""; combo_t=0.0; game_over=False; open_frames=0
-                motion_det = MotionDetector()
+                motion_det = MotionDetector(calib)
                 countdown=3; cd_end=now+1.0
             cv2.imshow("Spell Caster", canvas)
             if cv2.waitKey(1)&0xFF==ord('q'): break
@@ -916,6 +1205,18 @@ def main():
 
         # ── Motion spell detection ────────────────────────────────────────────
         motion_result = motion_det.update(int(palm_x), int(palm_y), raw_gesture, now) if hand_found else None
+
+        # Log near-miss when gesture changes (peak reached but spell didn't fire)
+        if motion_det.prev_session:
+            s = motion_det.prev_session
+            th_map = {"fist": calib["swipe_px"], "open": calib["quake_py"],
+                      "pinch": calib["arrow_pull"], "point": 0}
+            th = th_map.get(s["gesture"], 0)
+            if th and s["peak"] >= th * 0.4:
+                event = "cast_ok" if s["peak"] >= th else "near_miss"
+                logger.log(event, s["gesture"], "", s["peak"], th)
+            motion_det.prev_session = None
+
         if motion_result and now >= cooldown_until:
             mspell, mcx, mcy, mextra = motion_result
             pts = cast_motion(mspell, mcx, mcy, mextra, enemies, particles, effects)
@@ -923,6 +1224,11 @@ def main():
             combo_text = mspell.upper().replace("_"," ")
             combo_t    = now
             cooldown_until = now + 0.5
+            # Log successful cast with the spell name
+            th_map = {"sweep": calib["swipe_px"], "quake": calib["quake_py"],
+                      "arrow": calib["arrow_pull"], "orb": 0}
+            logger.log("cast", raw_gesture or "", mspell,
+                       motion_det._session_peak, th_map.get(mspell, 0))
 
         cur_gesture = raw_gesture
 
@@ -967,16 +1273,19 @@ def main():
 
         if show_tutorial:
             draw_tutorial(canvas)
+        if show_debug:
+            draw_debug_overlay(canvas, motion_det, calib, now)
 
         cv2.imshow("Spell Caster", canvas)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'): break
-        if key in (ord('h'), ord('H')):
-            show_tutorial = not show_tutorial
+        if key in (ord('h'), ord('H')): show_tutorial = not show_tutorial
+        if key in (ord('d'), ord('D')): show_debug    = not show_debug
 
     cap.release()
     cv2.destroyAllWindows()
     landmarker.close()
+    logger.close()
 
 
 if __name__ == "__main__":
